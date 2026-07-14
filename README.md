@@ -1,4 +1,4 @@
-Voici la partie 1 du README: <div align="center">
+<div align="center">
 
 # Adaptive Streaming Orchestration System
 
