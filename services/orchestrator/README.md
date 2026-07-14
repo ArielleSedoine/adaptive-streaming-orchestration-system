@@ -1,50 +1,63 @@
 # 🎬 Cloud Function: orchestrator
 
-**Nom de la fonction :** `orchestrator`  
-**Région :** `us-east4`  
-**Projet GCP :** `verse-dev-433901`  
-**Image de base :** `gcr.io/verse-dev-433901/base-ffmpeg-python:latest`  
+**Function name:** orchestrator
+**Trigger:** Eventarc (GCS → object.finalize)
+**Platform:** Cloud Run (container)
+**Region:** us-east4
+**GCP Project:** verse-dev-433901
+**Base image:** gcr.io/verse-dev-433901/base-ffmpeg-python:latest
 
 ---
 
-## 🎯 Objectif
+## 🎯 Purpose
 
-La fonction **`orchestrator`** sert de point d’entrée principal du pipeline **VOD (Video on Demand)** sur GCP.  
-Elle détecte automatiquement la dernière vidéo uploadée dans le bucket source, exécute plusieurs tâches automatisées et publie des messages Pub/Sub pour orchestrer le traitement multimédia.
+**orchestrator** is the main entry point of the *Video-On-Demand (VOD)* processing pipeline.
+Every newly uploaded .mp4 file in the source bucket automatically triggers:
+
+1- original video copy
+
+2- thumbnail generation using ffmpeg
+
+3- dynamic language detection (based on existing audio/subtitle files)
+
+4- metadata generation
+
+5- Pub/Sub fan-out for transcoding and per-language processing
 
 ---
 
-## ⚙️ Fonctionnalités principales
+## ⚙️ Main Features
 
-| Étape | Description |
+| Step | Description |
 |--------|--------------|
-| **1️⃣ Détection vidéo** | Recherche la dernière vidéo `.mp4` uploadée dans `vodunprocessedgcp`. |
-| **2️⃣ Copie originale** | Copie la vidéo d’origine vers `vodprocessedgcp` (`/original/`). |
-| **3️⃣ Génération du thumbnail** | Extrait une image statique (à 10 secondes) à l’aide de `ffmpeg`. |
-| **4️⃣ Détection des langues** | Identifie les pistes audio et sous-titres disponibles dans `/audio/` et `/caption/`. |
-| **5️⃣ Sauvegarde des métadonnées** | Crée un fichier `langs.json` contenant les langues détectées. |
-| **6️⃣ Publication des tâches** | Publie :<br>• une tâche Pub/Sub “video-worker” pour le transcodage SD/HD/UHD<br>• une tâche Pub/Sub “language-worker” par langue détectée |
+| **1️⃣ Automatic Trigger** | Uploading a .mp4 to vodunprocessedgcp triggers Eventarc. |
+| **2️⃣ Original Copy** | The file is copied into vodprocessedgcp/original/. |
+| **3️⃣ Local Thumbnail** | ffmpeg generates a frame (at 10 seconds) using a local temporary download. |
+| **4️⃣ Language Detection** | Dynamic scanning of /audio/ and /caption/ folders to detect existing languages. |
+| **5️⃣ Metadata Creation** | A metadata/langs.json file is generated automatically. |
+| **6️⃣ Task Publication** | Publishes: • one “video-task” Pub/Sub message • one “lang-task” message per detected language |
 
 ---
 
-## 🧱 Architecture GCP
+## 🧱 GCP Architecture
 
 ```text
 +--------------------------+
-| Cloud Function:          |
+| Cloud Run Service:       |
 |        orchestrator      |
+| (trigger: Eventarc GCS)  |
 +-----------+--------------+
             |
             | Pub/Sub
             v
   +------------------------+
-  | Topic 1: verse-dev-433901-video-task  |
-  |  → Cloud Function video-worker        |
+  | Topic: verse-dev-433901-video-task    |
+  |   → transcoding worker                |
   +--------------------------------------+
             |
-            | Pub/Sub
+            | Pub/Sub (per language)
             v
   +------------------------+
-  | Topic 2: verse-dev-433901-lang-tasks  |
-  |  → Cloud Function language-worker     |
+  | Topic: verse-dev-433901-lang-tasks    |
+  |   → language worker                   |
   +--------------------------------------+
