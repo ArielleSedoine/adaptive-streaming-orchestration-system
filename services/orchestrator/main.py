@@ -1,139 +1,198 @@
-import json
 import os
+import json
 import logging
 import subprocess
-from flask import jsonify, Request   # ✅ Ajout important
+from flask import Flask, request, jsonify
 from google.cloud import storage, pubsub_v1
 
-# -------- CONFIGURATION GÉNÉRALE --------
-PROJECT_ID = "verse-dev-433901"
-TOPIC_LANG = "verse-dev-433901-lang-tasks"
-TOPIC_VIDEO = "verse-dev-433901-video-task"
-SRC_BUCKET = "vodunprocessedgcp"
-DST_BUCKET = "vodprocessedgcp"
+# -------- CONFIG --------
+PROJECT_ID   = "verse-dev-433901"
+TOPIC_LANG   = "verse-dev-433901-lang-tasks"
+TOPIC_VIDEO  = "verse-dev-433901-video-task"
+SRC_BUCKET   = "vodunprocessedgcp"
+DST_BUCKET   = "vodprocessedgcp"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+app = Flask(__name__)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# --------- CLOUD FUNCTION ENTRYPOINT ---------
-def orchestrator(request: Request):
+publisher = pubsub_v1.PublisherClient()
+
+# =====================================================================
+# 🔥 EVENTARC ENTRYPOINT
+# =====================================================================
+def entrypoint(request):
+    event = request.get_json(silent=True)
+    if not event:
+        logger.error("❌ No JSON event received.")
+        return jsonify({"error": "No event"}), 200
+    return handle_new_object(event)
+
+# =====================================================================
+# 🟢 Parse event + routing logic
+# =====================================================================
+def handle_new_object(event):
+
+    logger.info(f"📩 Incoming Eventarc event: {event}")
+
+    bucket_name = event.get("bucket")
+    object_name = event.get("name")
+
+    if not bucket_name or not object_name:
+        logger.warning("⚠️ Missing bucket or object")
+        return ("Missing event data", 200)
+
+    base_name = os.path.splitext(os.path.basename(object_name))[0]
+    ext = os.path.splitext(object_name)[1].lower()
+
+    logger.info(f"🎯 Uploaded file detected: {object_name} (ext={ext})")
+
     try:
-        req = request.get_json(silent=True) or {}
-        source_bucket = req.get("source_bucket", SRC_BUCKET)
-        dest_bucket   = req.get("destination_bucket", DST_BUCKET)
+        if ext == ".mp4":
+            return orchestrate_video(bucket_name, object_name, base_name)
+        elif ext == ".wav":
+            return orchestrate_audio(bucket_name, object_name, base_name)
+        else:
+            logger.info("ℹ️ Unsupported file type.")
+            return ("Unsupported file type", 200)
 
-        # 1️⃣ Trouver la dernière vidéo .mp4
-        storage_client = storage.Client()
-        sb = storage_client.bucket(source_bucket)
-        mp4s = [b for b in sb.list_blobs() if b.name.lower().endswith(".mp4")]
-        if not mp4s:
-            logger.warning("⚠️ No .mp4 file found in source bucket.")
-            return jsonify({"status": "error", "message": "No .mp4 video found"}), 200  # ✅ renvoie toujours 200
+    except Exception:
+        logger.exception("❌ Error during orchestration")
+        return ("Error", 200)
 
-        last_blob = max(mp4s, key=lambda b: b.updated)
-        source_blob_name = last_blob.name
-        base_name = os.path.splitext(os.path.basename(source_blob_name))[0]
-        logger.info(f"🎞 Latest video detected: {source_blob_name}")
+# =====================================================================
+# 🎬 VIDEO WORKFLOW (.mp4)
+# =====================================================================
+def orchestrate_video(bucket_name, source_blob_name, base_name):
 
-        # 2️⃣ Copier l’original
-        copy_original_file(storage_client, last_blob, base_name, dest_bucket)
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(DST_BUCKET)
 
-        # 3️⃣ Générer le thumbnail
-        local_video = f"/tmp/{os.path.basename(source_blob_name)}"
-        download_blob(source_bucket, source_blob_name, local_video)
-        generate_thumbnail(base_name, local_video, dest_bucket)
+    # ---- STATUS MARKER (idempotent) ----
+    write_status_once(bucket, f"{base_name}/status/expect_video.txt")
 
-        if os.path.exists(local_video):
-            os.remove(local_video)
-            logger.info("🧹 Local video cleaned up from /tmp")
+    # 1) Copy original video
+    copy_original_file(storage_client, bucket_name, source_blob_name, base_name)
 
-        # 4️⃣ Détecter les langues
-        audio_langs, caption_langs = detect_available_languages(base_name, dest_bucket)
-        all_langs = sorted(set(audio_langs + caption_langs))
-        if not all_langs:
-            logger.warning("⚠️ No language assets found.")
-            return jsonify({"status": "error", "message": "No language assets found"}), 200
+    # 2) Thumbnail
+    blob_obj = storage_client.bucket(bucket_name).blob(source_blob_name)
+    generate_thumbnail_local(base_name, blob_obj, DST_BUCKET)
 
-        save_langs_json(base_name, dest_bucket, audio_langs, caption_langs)
+    # 3) Detect languages
+    audio_langs, caption_langs = detect_available_languages(base_name, DST_BUCKET)
+    all_langs = sorted(set(audio_langs + caption_langs))
 
-        # 5️⃣ Publier la tâche video-worker
-        publisher = pubsub_v1.PublisherClient()
-        topic_video = publisher.topic_path(PROJECT_ID, TOPIC_VIDEO)
-        publisher.publish(topic_video, json.dumps({
+    # 4) Save metadata
+    save_langs_json(base_name, DST_BUCKET, audio_langs, caption_langs)
+
+    # 5) Publish video task
+    publish_task(TOPIC_VIDEO, {
+        "base_file_name": base_name,
+        "source_blob_name": source_blob_name,
+        "destination_bucket": DST_BUCKET
+    })
+
+    # 6) Publish language tasks
+    for lang in all_langs:
+        publish_task(TOPIC_LANG, {
             "base_file_name": base_name,
             "source_blob_name": source_blob_name,
-            "destination_bucket": dest_bucket
-        }).encode("utf-8"))
-        logger.info("📤 Published video-worker task")
+            "language": lang,
+            "destination_bucket": DST_BUCKET
+        })
 
-        # 6️⃣ Publier une tâche par langue
-        topic_lang = publisher.topic_path(PROJECT_ID, TOPIC_LANG)
-        for lang in all_langs:
-            msg = {
-                "base_file_name": base_name,
-                "source_blob_name": source_blob_name,
-                "language": lang,
-                "destination_bucket": dest_bucket
-            }
-            publisher.publish(topic_lang, json.dumps(msg).encode("utf-8"))
-            logger.info(f"📤 Published language-worker task for {lang}")
+    logger.info("✨ Video orchestration DONE")
+    return ("OK", 200)
 
-        logger.info("🎯 Pub/Sub message ACK sent.")
-        return jsonify({
-            "status": "ok",
-            "message": f"✅ Published {len(all_langs)} language tasks + 1 video task for '{base_name}'."
-        }), 200
+# =====================================================================
+# 🎧 AUDIO-ONLY WORKFLOW (.wav)
+# =====================================================================
+def orchestrate_audio(bucket_name, source_blob_name, base_name):
 
-    except Exception as e:
-        logger.exception(f"❌ Error in orchestrator: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 200  # ✅ évite retry
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(DST_BUCKET)
 
-    finally:
-        # Nettoyage global /tmp
-        for path in os.listdir("/tmp"):
-            try:
-                full_path = os.path.join("/tmp", path)
-                if os.path.isfile(full_path):
-                    os.remove(full_path)
-            except Exception:
-                pass
-        logger.info("🧹 Global cleanup done in /tmp.")
+    # ---- STATUS MARKER (idempotent) ----
+    write_status_once(bucket, f"{base_name}/status/audio_only.txt")
 
+    # 1) Copy original audio
+    copy_original_file(storage_client, bucket_name, source_blob_name, base_name)
 
-# --------- UTILS ORCHESTRATOR ---------
-def copy_original_file(storage_client, source_blob, base_file_name, dest_bucket):
-    db = storage_client.bucket(dest_bucket)
-    new_name = f"{base_file_name}/original/{os.path.basename(source_blob.name)}"
-    source_blob.bucket.copy_blob(source_blob, db, new_name)
-    logger.info(f"✅ Original copied to gs://{dest_bucket}/{new_name}")
+    # 2) Detect languages
+    audio_langs, caption_langs = detect_available_languages(base_name, DST_BUCKET)
+    all_langs = sorted(set(audio_langs + caption_langs))
 
+    # 3) Save metadata
+    save_langs_json(base_name, DST_BUCKET, audio_langs, caption_langs)
 
-def download_blob(bucket_name, blob_name, dst):
-    storage.Client().bucket(bucket_name).blob(blob_name).download_to_filename(dst)
-    logger.info(f"⬇️ Downloaded gs://{bucket_name}/{blob_name} -> {dst}")
+    # 4) Publish language tasks
+    for lang in all_langs:
+        publish_task(TOPIC_LANG, {
+            "base_file_name": base_name,
+            "source_blob_name": source_blob_name,
+            "language": lang,
+            "destination_bucket": DST_BUCKET
+        })
 
+    logger.info("🎧 Audio-only orchestration DONE")
+    return ("OK", 200)
 
-def upload_blob(bucket, src, dst):
-    storage.Client().bucket(bucket).blob(dst).upload_from_filename(src)
-    logger.info(f"⬆️ Uploaded {src} -> gs://{bucket}/{dst}")
+# =====================================================================
+# 🔁 Pub/Sub helper
+# =====================================================================
+def publish_task(topic_name, payload):
+    topic = publisher.topic_path(PROJECT_ID, topic_name)
+    publisher.publish(topic, json.dumps(payload).encode("utf-8"))
+    logger.info(f"📤 Published {payload} to {topic_name}")
 
+# =====================================================================
+# 📁 Copy original file
+# =====================================================================
+def copy_original_file(storage_client, bucket_name, blob_name, base_file):
+    sb = storage_client.bucket(bucket_name).blob(blob_name)
+    db = storage_client.bucket(DST_BUCKET)
+    new_name = f"{base_file}/original/{os.path.basename(blob_name)}"
+    sb.bucket.copy_blob(sb, db, new_name)
+    logger.info(f"📁 Original copied → gs://{DST_BUCKET}/{new_name}")
 
-def generate_thumbnail(base_file_name, local_video_path, dest_bucket):
-    thumb = f"/tmp/{base_file_name}.jpg"
+# =====================================================================
+# 🖼 Thumbnail generation
+# =====================================================================
+def generate_thumbnail_local(base_file_name, blob_obj, dest_bucket):
+
+    local_video = f"/tmp/{base_file_name}.mp4"
+    local_thumb = f"/tmp/{base_file_name}.jpg"
+
     try:
+        blob_obj.download_to_filename(local_video)
+
         subprocess.run([
             "ffmpeg", "-loglevel", "error", "-y",
-            "-i", local_video_path,
-            "-ss", "00:00:10", "-vframes", "1", "-q:v", "2", thumb
+            "-i", local_video,
+            "-ss", "00:00:10",
+            "-vframes", "1",
+            "-q:v", "2",
+            local_thumb
         ], check=True)
-        upload_blob(dest_bucket, thumb, f"{base_file_name}/thumbnail/{base_file_name}.jpg")
-        logger.info("🖼 Thumbnail generated & uploaded")
+
+        upload_file(dest_bucket, local_thumb,
+            f"{base_file_name}/thumbnail/{base_file_name}.jpg")
+
     finally:
-        if os.path.exists(thumb):
-            os.remove(thumb)
-            logger.info("🧹 Thumbnail cleaned from /tmp")
+        for p in [local_video, local_thumb]:
+            if os.path.exists(p):
+                os.remove(p)
 
+def upload_file(bucket, src, dst):
+    storage.Client().bucket(bucket).blob(dst).upload_from_filename(src)
 
+# =====================================================================
+# 🌐 Detect languages dynamically
+# =====================================================================
 def detect_available_languages(base_file_name, dest_bucket):
     client = storage.Client()
     bucket = client.bucket(dest_bucket)
@@ -141,25 +200,41 @@ def detect_available_languages(base_file_name, dest_bucket):
 
     for blob in bucket.list_blobs(prefix=f"{base_file_name}/audio/"):
         fn = os.path.basename(blob.name)
-        if "_" in fn and "." in fn:
+        if "_" in fn:
             aud.add(fn.split("_")[-1].split(".")[0])
 
     for blob in bucket.list_blobs(prefix=f"{base_file_name}/caption/"):
         fn = os.path.basename(blob.name)
-        if "_" in fn and "." in fn:
+        if "_" in fn:
             caps.add(fn.split("_")[-1].split(".")[0])
 
-    logger.info(f"🔊 Audio languages: {sorted(aud)} | 💬 Captions: {sorted(caps)}")
     return sorted(aud), sorted(caps)
 
+def save_langs_json(base, bucket, aud, caps):
+    tmp = f"/tmp/{base}_langs.json"
+    with open(tmp, "w") as f:
+        json.dump({"audio": aud, "caption": caps}, f, indent=2)
+    upload_file(bucket, tmp, f"{base}/metadata/langs.json")
+    os.remove(tmp)
 
-def save_langs_json(base_file_name, dest_bucket, audio_langs, caption_langs):
-    tmp_path = f"/tmp/{base_file_name}_langs.json"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "audio": audio_langs,
-            "caption": caption_langs
-        }, f, indent=2, ensure_ascii=False)
-    upload_blob(dest_bucket, tmp_path, f"{base_file_name}/metadata/langs.json")
-    logger.info(f"🗂 langs.json saved to gs://{dest_bucket}/{base_file_name}/metadata/langs.json")
-    os.remove(tmp_path)
+# =====================================================================
+# 🛡 Status helper (RECOMMANDATION 1)
+# =====================================================================
+def write_status_once(bucket, path, content="1"):
+    blob = bucket.blob(path)
+    if not blob.exists():
+        blob.upload_from_string(content)
+        logger.info(f"📝 Status created: {path}")
+    else:
+        logger.info(f"ℹ️ Status already exists: {path}")
+
+# =====================================================================
+# 🟢 Health
+# =====================================================================
+@app.get("/health")
+def health():
+    return "OK", 200
+
+# LOCAL DEV MODE
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
