@@ -1,55 +1,75 @@
-# 🎬 Video Worker — Vosyn Verse Video Pipeline
+# 📦 Cloud Function: packager_final
 
-## 🧩 Description
-
-Le **video-worker** est un service **Cloud Run** déclenché automatiquement par **Pub/Sub**  
-(`projects/verse-dev-433901/topics/verse-dev-433901-video-task`).
-
-Il reçoit les métadonnées envoyées par le **service orchestrator**,  
-télécharge la vidéo originale depuis Cloud Storage,  
-et effectue un **transcodage automatique multi-résolution** :
-
-- 🎞 **SD (480p)**  
-- 🎞 **HD (720p)**  
-- 🎞 **UHD (1080p)**  
-
-Les fichiers encodés sont téléversés dans le bucket cible  
-(`gs://vodprocessedgcp`), et un marqueur `status/video_done.txt`  
-est créé pour signaler la fin du traitement.
+**Function name:** packager_final  
+**Trigger:** Pub/Sub (push subscription)  
+**Platform:** Cloud Run (container)  
+**Region:** us-east4  
+**GCP Project:** verse-dev-433901  
+**Base image:** gcr.io/verse-dev-433901/base-ffmpeg-python:latest  
 
 ---
 
-## ⚙️ Fonctionnalités principales
+## 🎯 Purpose
 
-- 📥 Téléchargement automatique depuis **Cloud Storage**
-- 🎬 Transcodage vidéo avec **FFmpeg**
-- ☁️ Téléversement des fichiers encodés vers `vodprocessedgcp`
-- 📄 Création d’un marqueur `video_done.txt` pour suivi de pipeline
-- 🧹 Nettoyage automatique du répertoire `/tmp`
-- 🪵 Journalisation complète dans **Cloud Logging**
-- 🧠 Protection contre les **retries infinis Pub/Sub**
+**packager_final** is the final stage of the *Video-On-Demand (VOD) & Audio-Only* processing pipeline.
+
+Its responsibility is to **assemble all processed media tracks** (video, audio, subtitles) into a **valid MPEG-DASH presentation** and generate the final:
+
+- `manifest.mpd`
+- `segment-*.m4s`
+- `status/packager_done.txt`
+
+The function supports **both video-based content (.mp4)** and **audio-only content (.wav)**.
 
 ---
 
-## 🧱 Architecture
+## ⚙️ Main Features
+
+| Step | Description |
+|--------|--------------|
+| **1️⃣ Pub/Sub Trigger** | Triggered by `language_done` events published by language workers. |
+| **2️⃣ Idempotence Check** | Skips execution if `packager_done.txt` already exists. |
+| **3️⃣ Distributed Lock (TTL)** | Uses a GCS-based lock with TTL to avoid concurrent or stuck executions. |
+| **4️⃣ Language Readiness Check** | Waits until all expected languages (from metadata) are completed. |
+| **5️⃣ Track Discovery** | Scans `dash/` folders to detect available video, audio, and subtitle tracks. |
+| **6️⃣ Audio-Only Support** | Allows DASH generation even when no video track is present. |
+| **7️⃣ DASH Packaging** | Uses MP4Box to generate `manifest.mpd` and media segments. |
+| **8️⃣ Final Validation** | Verifies uploaded DASH artifacts before marking completion. |
+
+---
+
+## 🎧 Supported Packaging Modes
+
+| User Upload | Packaging Result |
+|------------|------------------|
+| `.mp4` | DASH **Video + Audio + Subtitles** |
+| `.wav` | DASH **Audio-Only + Subtitles** |
+
+
+---
+
+## 🧱 GCP Architecture
 
 ```text
-Orchestrator
-   │
-   ├── Publie un message Pub/Sub : verse-dev-433901-video-task
-   ├── Publie un message Pub/Sub : verse-dev-433901-lang-tasks
-   │
-   ▼
-Video Worker (Cloud Run)
-   └── Crée /status/video_done.txt --> Publie un message Pub/Sub : verse-dev-433901-packager-tasks
-Language Workers (Cloud Run)
-   └── Créent /status/lang_xx_done.txt--> Publie un message Pub/Sub : verse-dev-433901-packager-tasks
-   │
-   ▼
-Packager Final (Cloud Run)
-   ├── Vérifie que toutes les pistes sont prêtes
-   ├── Assemble les vidéos SD/HD/UHD
-   ├── Ajoute les pistes audio (EN, FR, ES, JA, ZH…)
-   ├── Ajoute les sous-titres (VTT transformés en MP4)
-   ├── Génère le fichier manifest.mpd
-   └── Crée /status/packaged.txt
++------------------------------+
+| Cloud Run Service:           |
+|        packager_final        |
+| (trigger: Pub/Sub push)      |
++--------------+---------------+
+               |
+               | Google Cloud Storage
+               v
+     +---------------------------+
+     | dash/                     |
+     |  ├── video/*.mp4          |
+     |  ├── audio/*.mp4          |
+     |  ├── subtitles/*.mp4      |
+     |  └── manifest.mpd         |
+     +---------------------------+
+               |
+               v
+     +---------------------------+
+     | status/                   |
+     |  ├── packager_done.txt    |
+     |  └── packager_lock.txt    |
+     +---------------------------+
