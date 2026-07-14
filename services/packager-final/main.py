@@ -4,35 +4,49 @@ import base64
 import logging
 import subprocess
 import shutil
-from flask import Request, jsonify
+import time
+from flask import Flask, Request, jsonify
 from google.cloud import storage
 
-# ------------- CONFIG -------------
+# =====================================================
+# CONFIG
+# =====================================================
 PROJECT_ID = "verse-dev-433901"
 DST_BUCKET = "vodprocessedgcp"
+
+LOCK_TTL_SECONDS = 15 * 60
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
 
-# ------------- ENTRYPOINT -------------
+# =====================================================
+# ENTRYPOINT
+# =====================================================
 def packager_final(request: Request):
 
     tmp_dir = None
+    bucket = None
+    lock_blob_path = None
 
     try:
+
         # ------------------ DECODE PUBSUB ------------------
         envelope = request.get_json(silent=True)
+
         if not envelope or "message" not in envelope:
             logger.warning("⚠️ Invalid Pub/Sub envelope.")
-            return jsonify({"status": "error"}), 200  # ack, pas de retry
+            return jsonify({"status": "error"}), 200
 
         raw = envelope["message"]
         data = {}
 
         if "data" in raw:
             try:
-                data = json.loads(base64.b64decode(raw["data"]).decode("utf-8"))
+                data = json.loads(
+                    base64.b64decode(raw["data"]).decode("utf-8")
+                )
             except Exception:
                 logger.warning("⚠️ Invalid base64 in Pub/Sub.")
                 return jsonify({"status": "error"}), 200
@@ -42,10 +56,10 @@ def packager_final(request: Request):
         event_type = data.get("event")
 
         if not base_file:
-            logger.warning("⚠️ Missing base_file in Pub/Sub message.")
-            return jsonify({"status": "error", "msg": "missing base_file"}), 200
+            logger.warning("⚠️ Missing base_file.")
+            return jsonify({"status": "error"}), 200
 
-        logger.info(f"📦 packager_final triggered for {base_file} (event={event_type})")
+        logger.info(f"📦 packager_final triggered for {base_file} ({event_type})")
 
         storage_client = storage.Client()
         bucket = storage_client.bucket(dest_bucket_name)
@@ -55,147 +69,271 @@ def packager_final(request: Request):
             logger.info("✔ Already packaged — skipping.")
             return ("OK", 200)
 
-        # ------------------ LOCK CHECK ------------------
+        # ------------------ CONTENT TYPE ------------------
+        expect_video = bucket.blob(f"{base_file}/status/expect_video.txt").exists()
+        audio_only = bucket.blob(f"{base_file}/status/audio_only.txt").exists()
+
+        if expect_video and audio_only:
+            logger.warning("⚠️ Both markers exist. Forcing expect_video.")
+            audio_only = False
+
+        logger.info(f"🧭 Markers: expect_video={expect_video}, audio_only={audio_only}")
+
+        # ------------------ LOCK ------------------
         lock_blob_path = f"{base_file}/status/packager_lock.txt"
         lock_blob = bucket.blob(lock_blob_path)
 
         if lock_blob.exists():
-            logger.info("🔒 Lock active — another instance is processing. Skipping.")
-            return ("Locked", 200)
 
-        # CREATE LOCK
-        lock_blob.upload_from_string("1")
-        logger.info("🔐 Lock acquired.")
+            if lock_is_expired(lock_blob):
 
+                logger.warning("⏱️ Lock expired — deleting.")
+                try:
+                    lock_blob.delete()
+                except Exception:
+                    return ("Locked", 200)
 
-        # ------------------ STATUS FILES ------------------
-        statuses = list(bucket.list_blobs(prefix=f"{base_file}/status/"))
+            else:
 
-        video_done = any("video_done" in b.name for b in statuses)
-        langs_done = {
-            b.name.split("_")[1].split(".")[0]
-            for b in statuses if "lang_" in b.name
-        }
+                logger.info("🔒 Lock active.")
+                return ("Locked", 200)
 
-        if not video_done:
-            logger.info("⏳ Video not ready (video_done.txt missing).")
-            release_lock(bucket, lock_blob_path)
-            return ("Not ready", 200)
+        lock_blob.upload_from_string(str(time.time()))
+        logger.info("🔐 Lock acquired")
 
-        # ------------------ EXPECTED LANGS ------------------
+        # ------------------ EXPECTED LANGUAGES ------------------
+
         expected_langs = read_langs_from_metadata(bucket, base_file)
-        if expected_langs:
-            logger.info(f"🌐 Expected languages: {sorted(expected_langs)}")
-            if not expected_langs.issubset(langs_done):
-                logger.info(f"⏳ Not all languages ready. done={langs_done}")
-                release_lock(bucket, lock_blob_path)
-                return ("Not ready", 200)
 
+        if not expected_langs:
+
+            logger.info("⏳ Waiting for langs.json metadata")
+            release_lock(bucket, lock_blob_path)
+            return ("Waiting metadata", 200)
+
+        done_langs = set()
+
+        for blob in bucket.list_blobs(prefix=f"{base_file}/status/"):
+
+            name = os.path.basename(blob.name)
+
+            if name.startswith("lang_") and name.endswith("_done.txt"):
+
+                lang = name.replace("lang_", "").replace("_done.txt", "")
+                done_langs.add(lang)
+
+        logger.info(f"🌐 Expected languages: {expected_langs}")
+        logger.info(f"✅ Languages done: {done_langs}")
+
+        if not expected_langs.issubset(done_langs):
+
+            missing = expected_langs - done_langs
+            logger.info(f"⏳ Missing languages: {missing}")
+
+            release_lock(bucket, lock_blob_path)
+            return ("Waiting languages", 200)
+
+        logger.info("🚀 All languages ready. Starting packaging")
 
         # ------------------ LIST MEDIA ------------------
         media = list_all_media(bucket, base_file)
+
         videos = media["videos"]
         audios = media["audios"]
-        subs   = media["subs"]
+        subs = media["subs"]
 
-        logger.info(f"📊 Tracks → videos={len(videos)}, audios={len(audios)}, subs={len(subs)}")
+        logger.info(
+            f"📊 Tracks → videos={len(videos)}, audios={len(audios)}, subs={len(subs)}"
+        )
 
-        if not videos or not audios:
-            logger.info("⏳ Missing essential tracks.")
-            release_lock(bucket, lock_blob_path)
-            return ("Not ready", 200)
+        # ------------------ TRACK VALIDATION ------------------
 
+        if expect_video:
 
-        # ------------------ DOWNLOAD ALL ------------------
+            if not videos:
+
+                logger.info("⏳ Waiting for video tracks")
+                release_lock(bucket, lock_blob_path)
+                return ("Not ready", 200)
+
+            if not audios:
+
+                logger.info("⏳ Waiting for audio tracks")
+                release_lock(bucket, lock_blob_path)
+                return ("Not ready", 200)
+
+            logger.info("🎬 Video+Audio mode")
+
+        elif audio_only:
+
+            if not audios:
+
+                logger.info("⏳ Waiting for audio")
+                release_lock(bucket, lock_blob_path)
+                return ("Not ready", 200)
+
+            logger.info("🎧 Audio-only mode")
+
+        else:
+
+            logger.warning("⚠️ No marker — conservative mode")
+
+            if not audios:
+
+                release_lock(bucket, lock_blob_path)
+                return ("Not ready", 200)
+
+        # ------------------ DOWNLOAD ------------------
+
         tmp_dir = f"/tmp/{base_file}_dash"
         os.makedirs(tmp_dir, exist_ok=True)
 
-        all_tracks = videos + audios + subs
-        for path in all_tracks:
+        for path in videos + audios + subs:
+
             local = os.path.join(tmp_dir, os.path.basename(path))
             bucket.blob(path).download_to_filename(local)
-            logger.info(f"⬇️ Downloaded {path} -> {local}")
 
+            logger.info(f"⬇️ Downloaded {path}")
 
-        # ------------------ MP4BOX COMMAND ------------------
-        output_mpd = os.path.join(tmp_dir, "manifest.mpd")
-        mp4box_cmd = build_mp4box_command(tmp_dir, output_mpd)
+        # ------------------ MP4BOX ------------------
 
-        logger.info("⚙️ Running MP4Box:")
-        logger.info(" ".join(mp4box_cmd))
-        subprocess.run(mp4box_cmd, check=True)
+        file_hash, video_name = parse_base_file(base_file)
 
+        mpd_filename = f"{file_hash}{video_name}.mpd"
+        output_mpd = os.path.join(tmp_dir, mpd_filename)
 
-        # ------------------ UPLOAD OUTPUT ------------------
-        uploaded_objects = upload_manifest_and_segments(bucket, tmp_dir, base_file)
+        cmd = build_mp4box_command(tmp_dir, output_mpd)
 
+        logger.info("⚙️ Running MP4Box")
+        logger.info(" ".join(cmd))
 
-        # ------------------ VERIFICATION ------------------
-        missing = [obj for obj in uploaded_objects if not bucket.blob(obj).exists()]
+        subprocess.run(cmd, check=True)
+
+        # ------------------ UPLOAD ------------------
+
+        uploaded = upload_manifest_and_segments(bucket, tmp_dir, base_file)
+
+        # ------------------ VERIFY ------------------
+
+        missing = [o for o in uploaded if not bucket.blob(o).exists()]
+
         if missing:
-            logger.error(f"❌ Missing DASH objects: {missing}")
-            release_lock(bucket, lock_blob_path)
-            return ("Error: DASH incomplete", 500)
 
+            logger.error(f"❌ Missing DASH objects: {missing}")
+
+            release_lock(bucket, lock_blob_path)
+            return ("DASH incomplete", 500)
 
         # ------------------ DONE ------------------
+
         bucket.blob(f"{base_file}/status/packager_done.txt").upload_from_string("done")
+
         release_lock(bucket, lock_blob_path)
 
-        logger.info("🎉 Packaging complete!")
+        logger.info("🎉 Packaging complete")
+
         return ("OK", 200)
 
-
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ MP4Box failed: {e}")
-        release_lock(bucket, lock_blob_path)
-        return ("Error during packaging", 500)
 
-    except Exception as e:
-        logger.exception(f"❌ Unexpected error: {e}")
-        release_lock(bucket, lock_blob_path)
-        return ("Error (non-retry)", 200)
+        logger.error(f"❌ MP4Box failed: {e}")
+
+        if bucket and lock_blob_path:
+            release_lock(bucket, lock_blob_path)
+
+        return ("Packaging error", 500)
+
+    except Exception:
+
+        logger.exception("❌ Unexpected error")
+
+        if bucket and lock_blob_path:
+            release_lock(bucket, lock_blob_path)
+
+        return ("Error", 200)
 
     finally:
+
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             logger.info("🧹 Cleaned /tmp")
 
 
-# ---------------------- UTILITIES ----------------------
-def release_lock(bucket, path):
+# =====================================================
+# LOCK HELPERS
+# =====================================================
+def lock_is_expired(blob):
+
     try:
+
+        blob.reload()
+
+        age = time.time() - blob.time_created.timestamp()
+
+        return age > LOCK_TTL_SECONDS
+
+    except Exception:
+
+        return True
+
+
+def release_lock(bucket, path):
+
+    try:
+
         blob = bucket.blob(path)
+
         if blob.exists():
+
             blob.delete()
-            logger.info("🔓 Lock released.")
+
+            logger.info("🔓 Lock released")
+
     except Exception as e:
-        logger.error(f"⚠️ Failed to release lock: {e}")
+
+        logger.error(f"⚠️ Lock release error: {e}")
 
 
+# =====================================================
+# UTILITIES
+# =====================================================
 def packager_already_done(base_file, bucket_name):
+
     return storage.Client().bucket(bucket_name).blob(
         f"{base_file}/status/packager_done.txt"
     ).exists()
 
 
 def read_langs_from_metadata(bucket, base_file):
-    meta_blob = bucket.blob(f"{base_file}/metadata/langs.json")
-    if not meta_blob.exists():
+
+    blob = bucket.blob(f"{base_file}/metadata/langs.json")
+
+    if not blob.exists():
         return set()
+
     try:
-        data = json.loads(meta_blob.download_as_text())
+
+        data = json.loads(blob.download_as_text())
+
         return set(data.get("audio", [])) | set(data.get("caption", []))
-    except:
+
+    except Exception:
+
         return set()
 
 
 def list_all_media(bucket, base_file):
+
     prefix = f"{base_file}/dash/"
-    videos, audios, subs = [], [], []
+
+    videos = []
+    audios = []
+    subs = []
 
     for blob in bucket.list_blobs(prefix=prefix):
+
         name = blob.name
+
         if not name.endswith(".mp4"):
             continue
 
@@ -203,62 +341,129 @@ def list_all_media(bucket, base_file):
 
         if base.startswith("audio_"):
             audios.append(name)
+
         elif base.startswith("subs_"):
             subs.append(name)
-        elif ("_sd" in base) or ("_hd" in base) or ("_uhd" in base) or base.startswith("video_"):
+
+        elif base.startswith("video_") or any(
+            x in base for x in ["_sd", "_hd", "_uhd"]
+        ):
             videos.append(name)
 
-    return {"videos": videos, "audios": audios, "subs": subs}
+    return {
+
+        "videos": videos,
+        "audios": audios,
+        "subs": subs,
+    }
 
 
 def build_mp4box_command(tmp_dir, output_mpd):
+
     files = os.listdir(tmp_dir)
+
     cmd = [
-        "MP4Box","-dash","2000","-frag","2000","-rap",
-        "-bs-switching","no","-url-template",
-        "-segment-name","segment-$RepresentationID$-",
-        "-out",output_mpd
+
+        "MP4Box",
+        "-dash",
+        "2000",
+        "-frag",
+        "2000",
+        "-rap",
+        "-bs-switching",
+        "no",
+        "-url-template",
+        "-segment-name",
+        "segment-$RepresentationID$-",
+        "-out",
+        output_mpd,
     ]
 
-    # VIDEO
     video_files = sorted(
-        f for f in files
-        if f.endswith(".mp4") and ("_sd" in f or "_hd" in f or "_uhd" in f or f.startswith("video_"))
+
+        f
+        for f in files
+        if f.endswith(".mp4")
+        and (f.startswith("video_") or any(x in f for x in ["_sd", "_hd", "_uhd"]))
     )
 
     for idx, v in enumerate(video_files, start=1):
-        cmd.append(f"{os.path.join(tmp_dir,v)}#video:id={idx}")
 
-    # AUDIO
-    audio_files = sorted([f for f in files if f.startswith("audio_") and f.endswith(".mp4")])
+        cmd.append(f"{os.path.join(tmp_dir, v)}#video:id={idx}")
+
+    audio_files = sorted(
+
+        f for f in files if f.startswith("audio_") and f.endswith(".mp4")
+    )
+
     start_audio = len(video_files) + 1
-    for off, a in enumerate(audio_files):
-        lang = a.split("_")[1].split(".")[0]
-        cmd.append(f"{os.path.join(tmp_dir,a)}#audio:lang={lang}:id={start_audio+off}")
 
-    # SUBS
-    subs_files = sorted([f for f in files if f.startswith("subs_") and f.endswith(".mp4")])
+    for off, a in enumerate(audio_files):
+
+        lang = a.split("_")[1].split(".")[0]
+
+        cmd.append(
+
+            f"{os.path.join(tmp_dir, a)}#audio:lang={lang}:id={start_audio+off}"
+        )
+
+    subs_files = sorted(
+
+        f for f in files if f.startswith("subs_") and f.endswith(".mp4")
+    )
+
     start_subs = len(video_files) + len(audio_files) + 1
+
     for off, s in enumerate(subs_files):
+
         lang = s.split("_")[1].split(".")[0]
-        cmd.append(f"{os.path.join(tmp_dir,s)}#text:lang={lang}:id={start_subs+off}")
+
+        cmd.append(
+
+            f"{os.path.join(tmp_dir, s)}#text:lang={lang}:id={start_subs+off}"
+        )
 
     return cmd
 
 
 def upload_manifest_and_segments(bucket, tmp_dir, base_file):
+
     uploaded = []
 
     for root, _, files in os.walk(tmp_dir):
+
         for f in files:
+
             if (
+
                 f.endswith(".mpd")
                 or f.endswith(".m4s")
-                or (f.endswith(".mp4") and f.startswith("segment-") and f.endswith("-.mp4"))
+                or (f.endswith(".mp4") and f.startswith("segment-"))
             ):
+
                 local = os.path.join(root, f)
+
                 dest = f"{base_file}/dash/{f}"
+
                 bucket.blob(dest).upload_from_filename(local)
+
                 uploaded.append(dest)
 
     return uploaded
+
+
+def parse_base_file(base_file):
+
+    file_hash = base_file[:64]
+    video_name = base_file[64:]
+
+    return file_hash, video_name
+
+
+# =====================================================
+# HEALTH
+# =====================================================
+@app.get("/health")
+def health():
+
+    return "OK", 200
