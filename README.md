@@ -1149,11 +1149,14 @@ See the `LICENSE` file for additional details.
 
 Cloud Software Engineer
 
-GitHub:
-https://github.com/ArielleSedoine
+**Email:**
+notouom777@gmail.com
 
-LinkedIn:
+**LinkedIn:**
 https://www.linkedin.com/in/arielle-60178832a/
+
+**Website:**
+https://arielle-sedoineapp-vosyn2.vercel.app/
 
 ---
 
